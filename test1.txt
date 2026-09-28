@@ -1,0 +1,362 @@
+<#
+Remote Users Windows 11 Update Script
+Original author shown in source screenshots: Stephen Lee / EET-Eng
+
+TEST REVISION
+- Reconstructed from the screenshots provided in ChatGPT.
+- Main requested change: temporary pre-boot/autoboot bypass is NOT enabled during download.
+- Bypass evaluation is separate from the status logging chain.
+- Bypass is enabled when the LATEST matching SCCM UpdatesDeployment log state for the target update is ciStateInstalling.
+- ciStatePendingSoftReboot is included as a safety fallback in case the 10-minute recurring script misses the active installing state.
+- The registry marker is written only when EpeTemporaryAutoboot.exe reports success, so a failed attempt can retry on the next run.
+
+IMPORTANT:
+Compare this reconstructed test copy with the original .ps1 before production use because the source was supplied as screenshots.
+#>
+
+$ScriptVer = "1.0"
+$TestRevision = "BypassOnInstall-TEST"
+
+# Arguments
+# Arg[0] can be either the update GUID itself or the UpdatesDeployment.log GUID line used by the older usage example.
+$UpdateArg = $args[0]
+$ExpectedOSBuild = $args[1]       # Example: "10.0.26200"
+$NumberOfReboots = $args[2]       # Example: "3"
+
+# Normalize the update GUID if the complete UpdatesDeployment.log line was supplied.
+if ($UpdateArg -match 'SUM_([0-9A-Fa-f-]{36})') {
+    $UpdateGUID = $Matches[1]
+}
+else {
+    $UpdateGUID = $UpdateArg
+}
+
+$OSBuild = $((Get-WmiObject Win32_OperatingSystem).Version)
+
+# Original SCCM state signatures retained for historical/event logging.
+$Update_DownloadStarted   = "Update (Site_DDAD6EF5-72C2-4963-AF44-8A6BC6E0EB4D/SUM_$UpdateGUID) Progress: Status = ciStateDownloading, PercentComplete = 0"
+$Update_DownloadCompleted = "Update (Site_DDAD6EF5-72C2-4963-AF44-8A6BC6E0EB4D/SUM_$UpdateGUID) Progress: Status = ciStateDownloading, PercentComplete = 100"
+$Update_WaitInstall       = "Update (Site_DDAD6EF5-72C2-4963-AF44-8A6BC6E0EB4D/SUM_$UpdateGUID) Progress: Status = ciStateWaitInstall, PercentComplete = 0"
+$Update_InstallCompleted  = "Update (Site_DDAD6EF5-72C2-4963-AF44-8A6BC6E0EB4D/SUM_$UpdateGUID) Progress: Status = ciStateInstalling, PercentComplete = 100"
+$Update_PendingReboot     = "Update (Site_DDAD6EF5-72C2-4963-AF44-8A6BC6E0EB4D/SUM_$UpdateGUID) Progress: Status = ciStatePendingSoftReboot, PercentComplete = 0"
+
+$SCCMLogLocation = "$env:windir\CCM\Logs"
+$UpdateLogLocation = Get-ChildItem -Path $SCCMLogLocation -Include UpdatesDeployment* -File -Recurse -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime
+
+# Read SCCM logs oldest -> newest so Select-Object -Last 1 represents the latest matching entry.
+$UpdateLogContent = foreach ($UpdateLog in $UpdateLogLocation) {
+    Get-Content -Path $UpdateLog.FullName -ErrorAction SilentlyContinue
+}
+
+$LogFile = "$SCCMLogLocation\SLF_W11_OSUpdate_$ExpectedOSBuild.log"
+$SchTask = Get-ScheduledTask | Where-Object { $_.TaskName -eq "SLF_Fix_VPN" }
+
+if (!(Test-Path HKLM:\SOFTWARE\SunLifeBuild)) {
+    New-Item HKLM:\SOFTWARE\SunLifeBuild -Force -ErrorAction SilentlyContinue | Out-Null
+}
+
+$RegSLFBuild = Get-ItemProperty HKLM:\SOFTWARE\SunLifeBuild -ErrorAction SilentlyContinue
+$RunTime = Get-Date
+$culture = [Globalization.CultureInfo]::InvariantCulture
+$isVirtual = ((Get-WmiObject Win32_ComputerSystem).Model).Contains("VMware")
+
+Function LogWrite {
+    Param ([string]$logstring)
+    Start-Sleep -Seconds 1  # Prevent IO error from fast moving logging
+    Add-Content $LogFile -Value "$(Get-Date): $logstring"
+}
+
+LogWrite "***********Update Deployment Script v$ScriptVer started***********"
+LogWrite "Script version: $ScriptVer (for Win11 25H2 update)"
+LogWrite "Test revision: $TestRevision"
+LogWrite "Current OS Build: $OSBuild"
+LogWrite "Expected OS Build: $ExpectedOSBuild"
+LogWrite "Target Update GUID: $UpdateGUID"
+
+if ($OSBuild -lt $ExpectedOSBuild) {
+    # =========================
+    # PRE-UPGRADE ACTIONS
+    # =========================
+    LogWrite "Current OS build ($OSBuild) is lower than expected OS build ($ExpectedOSBuild), running Pre-upgrade actions"
+
+    # ARP Entry for SWD Tracking
+    if ($RegSLFBuild.Win11_25H2_Update_ARP_added -ne "True_$ExpectedOSBuild") {
+        LogWrite "Adding ARP Entry for SWD Tracking"
+        REG ADD "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Upgrade-Actions-Script-$ScriptVer" /v "DisplayName" /t REG_SZ /d "Win11 25H2 - Upgrade Actions Script $ScriptVer" /f | Out-Null
+        REG ADD "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Upgrade-Actions-Script-$ScriptVer" /v "DisplayVersion" /t REG_SZ /d "$ScriptVer" /f | Out-Null
+        REG ADD "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Upgrade-Actions-Script-$ScriptVer" /v "UninstallString" /t REG_SZ /d "n/a" /f | Out-Null
+        REG ADD "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Upgrade-Actions-Script-$ScriptVer" /v "Publisher" /t REG_SZ /d "Sun Life Financial" /f | Out-Null
+        New-ItemProperty -Path HKLM:\SOFTWARE\SunLifeBuild -Name 'Win11_25H2_Update_ARP_added' -Value "True_$ExpectedOSBuild" -PropertyType String -Force | Out-Null
+    }
+    else {
+        LogWrite "ARP Entry for SWD Tracking already added, skipping"
+    }
+
+    # Refresh registry snapshot because the script can run every 10 minutes.
+    $RegSLFBuild = Get-ItemProperty HKLM:\SOFTWARE\SunLifeBuild -ErrorAction SilentlyContinue
+
+    # Pre_Upgrade_Actions_LastRan tracking (original behavior retained)
+    if ($RegSLFBuild.Pre_Upgrade_Actions_LastRan -eq $null) {
+        New-ItemProperty -Path HKLM:\SOFTWARE\SunLifeBuild -Name 'Pre_Upgrade_Actions_LastRan' -Value "$(Get-Date)" -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+    }
+    else {
+        New-ItemProperty -Path HKLM:\SOFTWARE\SunLifeBuild -Name 'Pre_Upgrade_Actions_LastRan' -Value "$(Get-Date)" -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+    }
+
+    # --------------------------------------------------------------------
+    # Determine the LATEST state for this specific update from SCCM logs.
+    # This prevents an old historical "installing" line from enabling bypass.
+    # --------------------------------------------------------------------
+    $LatestUpdateProgressLine = $UpdateLogContent |
+        Where-Object {
+            ($_ -like "*SUM_$UpdateGUID*") -and
+            ($_ -match 'Progress:\s*Status\s*=\s*ciState')
+        } |
+        Select-Object -Last 1
+
+    $LatestUpdateState = $null
+    $LatestPercentComplete = $null
+
+    if ($LatestUpdateProgressLine) {
+        if ($LatestUpdateProgressLine -match 'Status\s*=\s*(ciState[A-Za-z0-9_]+)') {
+            $LatestUpdateState = $Matches[1]
+        }
+        if ($LatestUpdateProgressLine -match 'PercentComplete\s*=\s*(\d+)') {
+            $LatestPercentComplete = [int]$Matches[1]
+        }
+
+        LogWrite "Latest SCCM state for $UpdateGUID : $LatestUpdateState, PercentComplete=$LatestPercentComplete"
+    }
+    else {
+        LogWrite "No matching SCCM Progress state found yet for $UpdateGUID"
+    }
+
+    # ================================================================
+    # CHANGED BYPASS LOGIC
+    # ================================================================
+    # Do NOT enable bypass during download.
+    # Enable it independently from the status logging chain when the
+    # latest SCCM state says the update is actually installing.
+    # PendingSoftReboot is retained as a safety fallback in case the
+    # 10-minute recurring run misses the installing window.
+    # ================================================================
+    $ShouldEnableBypass = (
+        ($LatestUpdateState -eq 'ciStateInstalling') -or
+        ($LatestUpdateState -eq 'ciStatePendingSoftReboot')
+    )
+
+    if ($ShouldEnableBypass) {
+        if ($isVirtual) {
+            LogWrite "Installation phase detected on VM; no need to set auto-boot"
+        }
+        else {
+            # Refresh state immediately before deciding whether to run the executable.
+            $RegSLFBuild = Get-ItemProperty HKLM:\SOFTWARE\SunLifeBuild -ErrorAction SilentlyContinue
+
+            if ($RegSLFBuild.TempAutoBootEnabled -ne "True_$ExpectedOSBuild") {
+                LogWrite "Installation phase detected. Setting autoboot to $NumberOfReboots reboots"
+
+                $TempCMD = .\EpeTemporaryAutoboot.exe --number-of-reboots $NumberOfReboots
+
+                if ($TempCMD -like "*successfully*") {
+                    New-ItemProperty -Path HKLM:\SOFTWARE\SunLifeBuild `
+                        -Name 'TempAutoBootEnabled' `
+                        -Value "True_$ExpectedOSBuild" `
+                        -PropertyType String `
+                        -Force | Out-Null
+
+                    LogWrite "Temporary autoboot successfully enabled and registry marker written"
+                }
+                else {
+                    # Do not write the marker. The next 10-minute run can retry.
+                    LogWrite "Temporary autoboot command did not report success; marker not written so next run can retry"
+                }
+
+                LogWrite "Autoboot command result: $TempCMD"
+            }
+            else {
+                LogWrite "Autoboot has already been set for $ExpectedOSBuild"
+            }
+        }
+    }
+
+    # ================================================================
+    # STATUS LOGGING - KEPT SEPARATE FROM BYPASS CONTROL
+    # ================================================================
+    if ($LatestUpdateState -eq 'ciStateInstalling') {
+        if ($LatestPercentComplete -ge 100) {
+            LogWrite "Win11 25H2 update ($UpdateGUID) Phase1 install completed"
+        }
+        else {
+            LogWrite "Win11 25H2 update ($UpdateGUID) is installing... PercentComplete=$LatestPercentComplete"
+        }
+    }
+    elseif ($LatestUpdateState -eq 'ciStateWaitInstall') {
+        LogWrite "Win11 25H2 update ($UpdateGUID) download completed, waiting for install..."
+    }
+    elseif ($LatestUpdateState -eq 'ciStateDownloading') {
+        if ($LatestPercentComplete -ge 100) {
+            LogWrite "Win11 25H2 update ($UpdateGUID) download completed, waiting for install..."
+        }
+        else {
+            LogWrite "Win11 25H2 update ($UpdateGUID) is being downloaded... PercentComplete=$LatestPercentComplete"
+        }
+    }
+    elseif ($LatestUpdateState -eq 'ciStatePendingSoftReboot') {
+        LogWrite "Win11 25H2 update ($UpdateGUID) pending reboot..."
+    }
+    else {
+        LogWrite "Win11 25H2 update - install has not started yet, waiting..."
+    }
+}
+elseif ($ExpectedOSBuild -eq $OSBuild) {
+    # =========================
+    # POST-UPGRADE ACTIONS
+    # =========================
+    LogWrite "Current OS build ($OSBuild) matches expected OS build ($ExpectedOSBuild), running Post-upgrade actions"
+
+    # Create Upgrade timing tracking file
+    $RegSLFBuild = Get-ItemProperty HKLM:\SOFTWARE\SunLifeBuild -ErrorAction SilentlyContinue
+
+    if ($RegSLFBuild.Post_Upgrade_Actions_FirstRan -eq $null) {
+        LogWrite "Creating Post_Upgrade_Actions_FirstRan reg key"
+        New-ItemProperty -Path HKLM:\SOFTWARE\SunLifeBuild -Name 'Post_Upgrade_Actions_FirstRan' -Value "$RunTime" -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+
+        if ($RegSLFBuild.Pre_Upgrade_Actions_LastRan -ne $null) {
+            LogWrite "Creating dummy SLF_W11_25H2_UpgradeTime file"
+            $PreUpgradeTime = [DateTime]::ParseExact($RegSLFBuild.Pre_Upgrade_Actions_LastRan, 'MM/dd/yyyy HH:mm:ss', $culture)
+            $UpgradeMinutes = [math]::Round(($RunTime - $PreUpgradeTime).TotalMinutes)
+            $DummyExePath = "$env:windir\pciimage\DummyEXE"
+            if (!(Test-Path $DummyExePath)) {
+                New-Item -Path $DummyExePath -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+            }
+            $null | Out-File "$DummyExePath\SLF_W11_25H2_UpdateTime_${UpgradeMinutes}_minutes.exe"
+        }
+        else {
+            LogWrite "Pre_Upgrade_Actions_LastRan data is missing, skipping UpgradeTime file"
+        }
+    }
+    else {
+        LogWrite "Post_Upgrade_Actions_FirstRan reg key already set, skipping"
+    }
+
+    # VPN remediation
+    if ($isVirtual) {
+        LogWrite "Running on VM, no need to fix VPN"
+    }
+    else {
+        if ($RegSLFBuild.Win11_25H2_VPN_fixed -ne "True_$ExpectedOSBuild") {
+            LogWrite "Adding VPN reg keys to prevent VPN issues"
+
+            New-Item -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion -Name 'ThinkMan' -Force -ErrorAction SilentlyContinue | Out-Null
+
+            New-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\ThinkMan -Name 'ThinkSetCtl' -Value '00000002' -PropertyType DWord -Force | Out-Null
+            REG ADD "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\ThinkMan" /v "ThinkSetCtl" /t REG_DWORD /d "00000002" /reg:64 /F | Out-Null
+
+            New-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\ThinkMan -Name 'FnTrlLock' -Value '01' -PropertyType Binary -Force | Out-Null
+            REG ADD "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\ThinkMan" /v "FnTrlLock" /t REG_BINARY /d "01" /reg:64 /F | Out-Null
+
+            New-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\ThinkMan -Name 'BcHeadTime' -Value '43553' -PropertyType DWord -Force | Out-Null
+            REG ADD "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\ThinkMan" /v "BcHeadTime" /t REG_DWORD /d "43553" /reg:64 /F | Out-Null
+
+            New-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\ThinkMan -Name 'ThinkTimeCt' -Value '00' -PropertyType Binary -Force | Out-Null
+            REG ADD "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\ThinkMan" /v "ThinkTimeCt" /t REG_BINARY /d "00" /reg:64 /F | Out-Null
+
+            New-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\ThinkMan -Name 'ThinkCblAllow' -Value '01' -PropertyType Binary -Force | Out-Null
+            REG ADD "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\ThinkMan" /v "ThinkCblAllow" /t REG_BINARY /d "01" /reg:64 /F | Out-Null
+
+            # Set VPN ACLs for profile XML
+            LogWrite "Updating VPN Profile XML ACL"
+            $VPNPath = 'C:\ProgramData\Cisco\Cisco AnyConnect Secure Mobility Client'
+            if (Test-Path $VPNPath) {
+                $ACL = Get-Acl -Path $VPNPath
+                $AccessRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    "Everyone",
+                    "FullControl",
+                    "ContainerInherit,ObjectInherit",
+                    "None",
+                    "Allow"
+                )
+                $ACL.Access | ForEach-Object { [void]$ACL.RemoveAccessRule($_) }
+                $ACL.SetAccessRuleProtection($false, $false)
+                $ACL.AddAccessRule($AccessRule)
+                $ACL | Set-Acl -Path $VPNPath
+            }
+            else {
+                LogWrite "VPN profile path not found: $VPNPath"
+            }
+
+            # Set regkey to prevent re-run
+            New-ItemProperty -Path HKLM:\SOFTWARE\SunLifeBuild -Name 'Win11_25H2_VPN_fixed' -Value "True_$ExpectedOSBuild" -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+        else {
+            LogWrite "VPN issues already resolved"
+        }
+    }
+
+    # Check for AppLocker policies, remove if found
+    LogWrite "Checking for old AppLocker Policy"
+    if (Test-Path C:\Windows\System32\AppLocker) {
+        $AppLockerFiles = Get-ChildItem C:\Windows\System32\AppLocker -Recurse -Force -ErrorAction SilentlyContinue
+        foreach ($file in $AppLockerFiles) {
+            LogWrite "Old Policy found, removing: $($file.FullName)"
+            Remove-Item $file.FullName -Force -Recurse -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Set AppLocker Policy to clear all items
+    LogWrite "Setting blank AppLocker policy"
+    Import-Module AppLocker -ErrorAction SilentlyContinue
+    Set-AppLockerPolicy -XMLPolicy .\AppLocker_Clear.xml -ErrorAction SilentlyContinue
+    New-ItemProperty -Path HKLM:\SOFTWARE\SunLifeBuild -Name 'Win11_25H2_AppLocker_fixed' -Value "True_$ExpectedOSBuild" -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+
+    # Remove unused bypass reboots
+    if ($isVirtual) {
+        LogWrite "Running on VM, no need to reset auto-boot"
+    }
+    else {
+        LogWrite "Running on physical machine, need to reset auto-boot"
+        $TempCMD = .\EpeTemporaryAutoboot.exe -clear
+
+        if ($TempCMD -like "*successfully*") {
+            LogWrite "Removing unused bypass reboot - success"
+        }
+        else {
+            LogWrite "Removing unused bypass reboot - failed"
+        }
+    }
+
+    # SCCM Client Actions
+    $RegSLFBuild = Get-ItemProperty HKLM:\SOFTWARE\SunLifeBuild -ErrorAction SilentlyContinue
+    if ($RegSLFBuild.Win11_25H2_sccm_ClientActions_ran -ne "True_$ExpectedOSBuild") {
+        LogWrite "Forcing SCCM Client Actions: DDC / Machine Policy"
+
+        $GUIDs = '{00000000-0000-0000-0000-000000000003}',
+                 '{00000000-0000-0000-0000-000000000021}',
+                 '{00000000-0000-0000-0000-000000000022}',
+                 '{00000000-0000-0000-0000-000000000113}'
+
+        $ComputerName = '.'
+        foreach ($GUID in $GUIDs) {
+            Invoke-WmiMethod -ComputerName $ComputerName -Namespace root\ccm -Path SMS_Client -Name TriggerSchedule -ArgumentList $GUID -ErrorAction SilentlyContinue | Out-Null
+        }
+
+        New-ItemProperty -Path HKLM:\SOFTWARE\SunLifeBuild -Name 'Win11_25H2_sccm_ClientActions_ran' -Value "True_$ExpectedOSBuild" -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+    }
+    else {
+        LogWrite "SCCM Client Actions already ran, skipping"
+    }
+
+    # Remove VPN Fix Task if found
+    if ($SchTask -ne $null) {
+        LogWrite "Found VPN Fix Task, removing"
+        Unregister-ScheduledTask -TaskName "SLF_Fix_VPN" -Confirm:$false -ErrorAction SilentlyContinue
+    }
+
+    LogWrite "***********Post Actions Complete. Exiting Script***********"
+    exit 0
+}
+else {
+    LogWrite "Current OS build ($OSBuild) is higher than expected OS build ($ExpectedOSBuild), exiting script"
+}
