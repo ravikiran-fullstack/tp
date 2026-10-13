@@ -1,0 +1,38 @@
+
+# Intune Remediations - DETECTION - 40 GB pre-25H2 cleanup.
+# Run as SYSTEM, 64-bit Windows PowerShell 5.1.
+# Exit 1 triggers remediation; exit 0 = already above 40 GB or already attempted this policy.
+
+$TargetFreeGB = 40
+$PolicyVersion = 'TempAll-DO-40GB-v1'
+$ReportFile = Join-Path $env:ProgramData 'Win11TempCleanup\LastRun.json'
+
+try {
+    $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" -ErrorAction Stop
+    if (-not $disk) { throw 'System disk unavailable' }
+    $currentGB = [math]::Round([double]$disk.FreeSpace / 1GB, 2)
+} catch {
+    Write-Output 'Status=DetectionFailed; Reason=CannotReadSystemDrive'
+    exit 1
+}
+
+if ($currentGB -ge $TargetFreeGB) {
+    Write-Output ("Status=Ready; CurrentGB={0}; TargetGB={1}" -f $currentGB, $TargetFreeGB)
+    exit 0
+}
+
+# A completed attempt is not re-run indefinitely when temp + DO cannot reach 40 GB.
+# Increment PolicyVersion in BOTH scripts if a new cleanup attempt is required.
+if (Test-Path -LiteralPath $ReportFile -PathType Leaf) {
+    try {
+        $r = Get-Content -LiteralPath $ReportFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($r.Completed -eq $true -and $r.PolicyVersion -eq $PolicyVersion) {
+            Write-Output ("Status=CleanupAttempted; BeforeGB={0}; AfterGB={1}; TempFreedGB={2}; DOFreedGB={3}; TotalFreedGB={4}; CurrentGB={5}; Meets40GB={6}; Next={7}" -f `
+                $r.BeforeGB, $r.AfterGB, $r.TempFreedGB, $r.DOFreedGB, $r.TotalFreedGB, $currentGB, ($currentGB -ge $TargetFreeGB), $r.NextAction)
+            exit 0
+        }
+    } catch { }
+}
+
+Write-Output ("Status=CleanupNeeded; BeforeGB={0}; TargetGB={1}" -f $currentGB, $TargetFreeGB)
+exit 1
