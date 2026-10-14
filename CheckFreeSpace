@@ -1,0 +1,31 @@
+
+# Windows 11 25H2 pre-target cleanup - Intune detection
+# Run as SYSTEM with 64-bit Windows PowerShell 5.1.
+# Exit 1 = less than 40 GB free -> trigger remediation.
+# Exit 0 = 40 GB or more free -> skip remediation.
+
+$TargetGB = 40
+
+try {
+    $drive = $env:SystemDrive
+    $disk = Get-CimInstance -ClassName Win32_LogicalDisk `
+        -Filter "DeviceID='$drive'" -ErrorAction Stop
+    if ($null -eq $disk -or $null -eq $disk.FreeSpace) {
+        throw 'Unable to read system drive.'
+    }
+
+    $freeBytes = [double]$disk.FreeSpace
+    $freeGB = [math]::Round($freeBytes / 1GB, 2)
+}
+catch {
+    Write-Output 'Status=DetectionError; Reason=CannotReadSystemDrive'
+    exit 1
+}
+
+if ($freeBytes -lt ($TargetGB * 1GB)) {
+    Write-Output "Status=CleanupRequired; BeforeGB=$freeGB; TargetGB=$TargetGB"
+    exit 1
+}
+
+Write-Output "Status=NoCleanupRequired; FreeGB=$freeGB; TargetGB=$TargetGB"
+exit 0
