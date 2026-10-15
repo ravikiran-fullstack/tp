@@ -1,0 +1,629 @@
+
+# ============================================================
+# WINDOWS 11 25H2 - PRE-UPGRADE DISK CLEANUP
+# INTUNE REMEDIATION SCRIPT
+# ============================================================
+#
+# Target: 40 GB free space
+# Run as: SYSTEM
+# PowerShell: 64-bit Windows PowerShell 5.1
+#
+# Cleanup order:
+# 1. Windows Temp and user Temp files
+# 2. Application CrashDumps
+# 3. Delivery Optimization cache
+# 4. Eligible SCCM/CCM cache
+# 5. DirectX shader cache
+# 6. Report before and after disk space
+#
+# Excludes dedicated service-account Temp folders.
+# Includes standard service-account CrashDumps.
+# Does not stop services, reboot, or run DISM.
+# ============================================================
+
+
+# -------------------------------
+# CONFIGURATION
+# -------------------------------
+
+$TargetGB = 40
+$TargetBytes = $TargetGB * 1GB
+$CCMMinUnusedDays = 30
+
+$ReportDirectory = Join-Path $env:ProgramData 'Win11TempCleanup'
+$ReportPath = Join-Path $ReportDirectory 'LastRun.json'
+
+
+# -------------------------------
+# FUNCTION: GET FREE SPACE
+# -------------------------------
+
+function Get-FreeBytes {
+
+    $disk = Get-CimInstance `
+        -ClassName Win32_LogicalDisk `
+        -Filter "DeviceID='$($env:SystemDrive)'" `
+        -ErrorAction Stop
+
+    if ($null -eq $disk -or $null -eq $disk.FreeSpace) {
+        throw 'Unable to read system drive.'
+    }
+
+    return [double]$disk.FreeSpace
+}
+
+
+# -------------------------------
+# FUNCTION: CONVERT TO GB
+# -------------------------------
+
+function Convert-ToGB {
+
+    param([double]$Bytes)
+
+    return [math]::Round(($Bytes / 1GB), 2)
+}
+
+
+# -------------------------------
+# FUNCTION: DELETE ACCESSIBLE FILES
+# -------------------------------
+
+function Clear-FileTree {
+
+    param(
+        [string]$Root,
+        [switch]$DumpsOnly
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Root)) {
+        return
+    }
+
+    try {
+
+        if (-not (Test-Path -LiteralPath $Root `
+                -PathType Container -ErrorAction Stop)) {
+            return
+        }
+
+        $RootItem = Get-Item -LiteralPath $Root `
+            -Force -ErrorAction Stop
+
+        # Skip junctions and symbolic links
+
+        if ($RootItem.Attributes -band
+            [IO.FileAttributes]::ReparsePoint) {
+            return
+        }
+
+        # Only clean folders on the system drive
+
+        if ([IO.Path]::GetPathRoot($RootItem.FullName) -ine
+            ($env:SystemDrive + '\')) {
+            return
+        }
+
+    }
+    catch {
+        $script:SkippedFolders++
+        return
+    }
+
+    $Pending = New-Object 'System.Collections.Generic.Stack[string]'
+    $Pending.Push($RootItem.FullName)
+
+    while ($Pending.Count -gt 0) {
+
+        $Folder = $Pending.Pop()
+
+        try {
+            $Items = @(
+                Get-ChildItem -LiteralPath $Folder `
+                    -Force -ErrorAction Stop
+            )
+        }
+        catch {
+            $script:SkippedFolders++
+            continue
+        }
+
+        foreach ($Item in $Items) {
+
+            # Do not follow symbolic links or junctions
+
+            if ($Item.Attributes -band
+                [IO.FileAttributes]::ReparsePoint) {
+
+                $script:SkippedLinks++
+                continue
+            }
+
+            # Process subfolders
+
+            if ($Item.PSIsContainer) {
+                $Pending.Push($Item.FullName)
+                continue
+            }
+
+            # In CrashDumps, delete dump files only
+
+            if ($DumpsOnly -and
+                $Item.Extension -notin @('.dmp', '.mdmp', '.hdmp')) {
+                continue
+            }
+
+            try {
+
+                Remove-Item -LiteralPath $Item.FullName `
+                    -Force -ErrorAction Stop
+
+                $script:DeletedFiles++
+
+                if ($DumpsOnly) {
+                    $script:CrashDumpFilesDeleted++
+                }
+
+            }
+            catch {
+
+                $script:SkippedFiles++
+
+                if ($DumpsOnly) {
+                    $script:CrashDumpFilesSkipped++
+                }
+            }
+        }
+    }
+}
+
+
+# -------------------------------
+# STEP 1: CHECK DISK SPACE
+# -------------------------------
+
+try {
+    $BeforeBytes = Get-FreeBytes
+}
+catch {
+    Write-Output 'Status=Error; Reason=CannotReadSystemDrive'
+    exit 1
+}
+
+if ($BeforeBytes -ge $TargetBytes) {
+
+    $BeforeGB = Convert-ToGB $BeforeBytes
+
+    Write-Output "Status=NoCleanupNeeded; BeforeGB=$BeforeGB; AfterGB=$BeforeGB"
+
+    exit 0
+}
+
+
+# -------------------------------
+# INITIALIZE COUNTERS
+# -------------------------------
+
+$DeletedFiles = 0
+$SkippedFiles = 0
+$SkippedFolders = 0
+$SkippedLinks = 0
+
+$CrashDumpFilesDeleted = 0
+$CrashDumpFilesSkipped = 0
+
+$CCMRemoved = 0
+$CCMSkipped = 0
+
+$CrashDumpStatus = 'NotNeeded'
+$DOStatus = 'NotNeeded'
+$CCMStatus = 'NotNeeded'
+$ShaderStatus = 'NotNeeded'
+$ProfileStatus = 'Unavailable'
+
+
+# -------------------------------
+# STEP 2: CLEAN WINDOWS TEMP
+# -------------------------------
+
+# Dedicated service-account Temp folders excluded.
+
+$TempFolders = @(
+    (Join-Path $env:windir 'Temp')
+)
+
+$Profiles = @()
+
+try {
+
+    $Profiles = @(
+        Get-CimInstance Win32_UserProfile -ErrorAction Stop |
+        Where-Object {
+            -not $_.Special -and
+            $_.LocalPath -and
+            ([IO.Path]::GetPathRoot($_.LocalPath) -ieq
+                ($env:SystemDrive + '\'))
+        }
+    )
+
+    foreach ($Profile in $Profiles) {
+
+        $TempFolders += Join-Path `
+            $Profile.LocalPath 'AppData\Local\Temp'
+    }
+
+    $ProfileStatus = 'Enumerated'
+
+}
+catch {
+    $ProfileStatus = 'Unavailable'
+}
+
+# Delete all accessible Temp files, regardless of age
+
+foreach ($Folder in @($TempFolders | Sort-Object -Unique)) {
+
+    Clear-FileTree -Root $Folder
+}
+
+$TempAfter = Get-FreeBytes
+
+
+# -------------------------------
+# STEP 3: CRASH DUMP CLEANUP
+# -------------------------------
+
+$DumpAfter = $TempAfter
+
+if ($TempAfter -lt $TargetBytes) {
+
+    $DumpFolders = @(
+
+        (Join-Path $env:windir `
+            'System32\config\systemprofile\AppData\Local\CrashDumps')
+
+        (Join-Path $env:windir `
+            'ServiceProfiles\LocalService\AppData\Local\CrashDumps')
+
+        (Join-Path $env:windir `
+            'ServiceProfiles\NetworkService\AppData\Local\CrashDumps')
+    )
+
+    # Add regular-user crash dump folders
+
+    if ($ProfileStatus -eq 'Enumerated') {
+
+        foreach ($Profile in $Profiles) {
+
+            $DumpFolders += Join-Path `
+                $Profile.LocalPath 'AppData\Local\CrashDumps'
+        }
+    }
+
+    # Delete only .dmp, .mdmp and .hdmp files
+
+    foreach ($Folder in @($DumpFolders | Sort-Object -Unique)) {
+
+        Clear-FileTree -Root $Folder -DumpsOnly
+    }
+
+    $CrashDumpStatus = 'Processed'
+
+    $DumpAfter = Get-FreeBytes
+}
+
+
+# -------------------------------
+# STEP 4: DELIVERY OPTIMIZATION
+# -------------------------------
+
+$DOAfter = $DumpAfter
+
+if ($DumpAfter -lt $TargetBytes) {
+
+    try {
+
+        Import-Module DeliveryOptimization -ErrorAction Stop
+
+        Get-Command Delete-DeliveryOptimizationCache `
+            -ErrorAction Stop | Out-Null
+
+        $Transfers = @(
+            Get-DeliveryOptimizationStatus -ErrorAction Stop
+        )
+
+        $Active = @(
+            $Transfers |
+            Where-Object {
+                [string]$_.Status -match 'Download|Upload|Transfer'
+            }
+        )
+
+        if ($Active.Count -gt 0) {
+
+            $DOStatus = 'SkippedActiveTransfer'
+
+        }
+        else {
+
+            # Keep pinned DO content
+
+            Delete-DeliveryOptimizationCache `
+                -Force -ErrorAction Stop | Out-Null
+
+            $DOStatus = 'Cleared'
+        }
+
+    }
+    catch {
+        $DOStatus = 'FailedOrUnavailable'
+    }
+
+    $DOAfter = Get-FreeBytes
+}
+
+
+# -------------------------------
+# STEP 5: SCCM / CCM CACHE
+# -------------------------------
+
+# Only use Configuration Manager client cache API.
+# Never delete C:\Windows\ccmcache directly.
+# Preserve referenced, persistent, incomplete and
+# unverified content.
+
+$CCMAfter = $DOAfter
+
+if ($DOAfter -lt $TargetBytes) {
+
+    try {
+
+        $Manager = New-Object `
+            -ComObject 'UIResource.UIResourceMgr' `
+            -ErrorAction Stop
+
+        $Cache = $Manager.GetCacheInfo()
+
+        $Entries = @(
+            $Cache.GetCacheElements()
+        )
+
+        $Metadata = @(
+            Get-CimInstance `
+                -Namespace 'root\ccm\SoftMgmtAgent' `
+                -ClassName CacheInfoEx `
+                -ErrorAction Stop
+        )
+
+        $Cutoff = (Get-Date).AddDays(-$CCMMinUnusedDays)
+
+        $CCMStatus = 'Processed'
+
+        foreach ($Entry in $Entries) {
+
+            if ((Get-FreeBytes) -ge $TargetBytes) {
+                break
+            }
+
+            $Location = ([string]$Entry.Location).TrimEnd('\')
+
+            if (-not $Location) {
+                $CCMSkipped++
+                continue
+            }
+
+            $Matches = @(
+                $Metadata |
+                Where-Object {
+                    $_.Location -and
+                    (([string]$_.Location).TrimEnd('\') -ieq $Location)
+                }
+            )
+
+            if ($Matches.Count -ne 1) {
+                $CCMSkipped++
+                continue
+            }
+
+            $Item = $Matches[0]
+
+            # Do not remove protected content
+
+            if (
+                $null -eq $Item.ReferenceCount -or
+                $null -eq $Item.PersistInCache -or
+                $null -eq $Item.ContentComplete -or
+                [int]$Item.ReferenceCount -gt 0 -or
+                [bool]$Item.PersistInCache -or
+                -not [bool]$Item.ContentComplete -or
+                [bool]$Item.PeerCaching
+            ) {
+                $CCMSkipped++
+                continue
+            }
+
+            # Content must be unused for 30 days
+
+            $LastUsed = [datetime]::MinValue
+
+            $DateIsValid = [datetime]::TryParse(
+                [string]$Item.LastReferenced,
+                [ref]$LastUsed
+            )
+
+            if (-not $DateIsValid -or $LastUsed -ge $Cutoff) {
+
+                $CCMSkipped++
+                continue
+            }
+
+            try {
+
+                $Cache.DeleteCacheElement(
+                    [string]$Entry.CacheElementID
+                )
+
+                $CCMRemoved++
+
+            }
+            catch {
+                $CCMSkipped++
+            }
+        }
+
+    }
+    catch {
+        $CCMStatus = 'UnavailableOrFailed'
+    }
+
+    $CCMAfter = Get-FreeBytes
+}
+
+
+# -------------------------------
+# STEP 6: DIRECTX SHADER CACHE
+# -------------------------------
+
+$ShaderAfter = $CCMAfter
+
+if ($CCMAfter -lt $TargetBytes) {
+
+    if ($ProfileStatus -eq 'Enumerated') {
+
+        foreach ($Profile in $Profiles) {
+
+            Clear-FileTree -Root (
+                Join-Path $Profile.LocalPath 'AppData\Local\D3DSCache'
+            )
+        }
+
+        $ShaderStatus = 'Processed'
+
+    }
+    else {
+        $ShaderStatus = 'SkippedNoProfiles'
+    }
+
+    $ShaderAfter = Get-FreeBytes
+}
+
+
+# -------------------------------
+# STEP 7: FINAL DISK SPACE
+# -------------------------------
+
+$AfterBytes = Get-FreeBytes
+
+$BeforeGB = Convert-ToGB $BeforeBytes
+$AfterGB = Convert-ToGB $AfterBytes
+
+$RecoveredGB = Convert-ToGB (
+    $AfterBytes - $BeforeBytes
+)
+
+$TempRecoveredGB = Convert-ToGB (
+    $TempAfter - $BeforeBytes
+)
+
+$DumpRecoveredGB = Convert-ToGB (
+    $DumpAfter - $TempAfter
+)
+
+$DORecoveredGB = Convert-ToGB (
+    $DOAfter - $DumpAfter
+)
+
+$CCMRecoveredGB = Convert-ToGB (
+    $CCMAfter - $DOAfter
+)
+
+$ShaderRecoveredGB = Convert-ToGB (
+    $ShaderAfter - $CCMAfter
+)
+
+$Meets40GB = ($AfterBytes -ge $TargetBytes)
+
+
+# -------------------------------
+# STEP 8: SAVE CLEANUP REPORT
+# -------------------------------
+
+$Report = [ordered]@{
+
+    Timestamp = (Get-Date).ToString('s')
+    ComputerName = $env:COMPUTERNAME
+
+    TargetGB = $TargetGB
+
+    BeforeGB = $BeforeGB
+    AfterGB = $AfterGB
+    RecoveredGB = $RecoveredGB
+
+    TempRecoveredGB = $TempRecoveredGB
+    CrashDumpRecoveredGB = $DumpRecoveredGB
+    DORecoveredGB = $DORecoveredGB
+    CCMRecoveredGB = $CCMRecoveredGB
+    ShaderRecoveredGB = $ShaderRecoveredGB
+
+    FilesDeleted = $DeletedFiles
+    FilesSkipped = $SkippedFiles
+
+    CrashDumpFilesDeleted = $CrashDumpFilesDeleted
+    CrashDumpFilesSkipped = $CrashDumpFilesSkipped
+    CrashDumpStatus = $CrashDumpStatus
+
+    CCMEntriesRemoved = $CCMRemoved
+    CCMEntriesSkipped = $CCMSkipped
+
+    ProfileStatus = $ProfileStatus
+    DOStatus = $DOStatus
+    CCMStatus = $CCMStatus
+    ShaderStatus = $ShaderStatus
+
+    Meets40GB = $Meets40GB
+}
+
+try {
+
+    New-Item `
+        -ItemType Directory `
+        -Path $ReportDirectory `
+        -Force `
+        -ErrorAction Stop | Out-Null
+
+    $Report |
+        ConvertTo-Json -Depth 3 |
+        Set-Content `
+            -LiteralPath $ReportPath `
+            -Encoding UTF8 `
+            -ErrorAction Stop
+
+}
+catch {
+    Write-Output 'Warning=CouldNotSaveLocalReport'
+}
+
+
+# -------------------------------
+# STEP 9: OUTPUT TO INTUNE
+# -------------------------------
+
+Write-Output (
+    "Status=Completed; BeforeGB={0}; AfterGB={1}; RecoveredGB={2}; TempGB={3}; DumpGB={4}; DumpsDeleted={5}; DOGB={6}; CCMGB={7}; ShaderGB={8}; Deleted={9}; CCMPurged={10}; DO={11}; CCM={12}; Meets40GB={13}" -f
+    $BeforeGB,
+    $AfterGB,
+    $RecoveredGB,
+    $TempRecoveredGB,
+    $DumpRecoveredGB,
+    $CrashDumpFilesDeleted,
+    $DORecoveredGB,
+    $CCMRecoveredGB,
+    $ShaderRecoveredGB,
+    $DeletedFiles,
+    $CCMRemoved,
+    $DOStatus,
+    $CCMStatus,
+    $Meets40GB
+)
+
+exit 0
