@@ -1,0 +1,39 @@
+Detected state
+
+Admin script action
+
+25H2 not applicable / not targeted
+
+Do nothing
+
+Update available but user hasn’t started it
+
+Do nothing
+
+Downloading
+
+Usually do nothing
+
+Download complete / preparing to install
+
+Enable Trellix bypasses
+
+Installing
+
+Keep bypass active
+
+Pending restart
+
+Keep bypass active
+
+Restart / upgrade occurring
+
+Keep bypass active
+
+Windows 25H2 successfully installed
+
+Remove all 3 bypasses
+
+Installation failed
+
+Restore bypass after a defined timeout/failsafe
