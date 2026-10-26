@@ -1,0 +1,269 @@
+
+# ==================================================
+# Windows 11 25H2 - Pre-Upgrade Disk Cleanup
+# Target Free Space: 45 GB
+# Run in SYSTEM context using 64-bit PowerShell
+# ==================================================
+
+$TargetGB = 45
+$ErrorActionPreference = "Stop"
+
+$Stats = @{
+    FilesDeleted = 0
+    FilesSkipped = 0
+    SCCMDeleted  = 0
+    SCCMFailed   = 0
+}
+
+$Results = New-Object System.Collections.Generic.List[string]
+
+function Get-FreeBytes {
+    $Disk = Get-CimInstance Win32_LogicalDisk `
+        -Filter "DeviceID='C:'" -ErrorAction Stop
+
+    if (-not $Disk) {
+        throw "C: drive not found"
+    }
+
+    return [double]$Disk.FreeSpace
+}
+
+function Format-GB {
+    param([double]$Bytes)
+    return [math]::Round($Bytes / 1GB, 2)
+}
+
+# Clean files recursively without following junctions.
+# Keep the approved root directory intact.
+function Clear-SafeFolder {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        return
+    }
+
+    $Stack = New-Object 'System.Collections.Generic.Stack[string]'
+    $Directories = New-Object 'System.Collections.Generic.List[string]'
+
+    $Stack.Push($Path)
+
+    while ($Stack.Count -gt 0) {
+        $Current = $Stack.Pop()
+
+        try {
+            $Items = @(Get-ChildItem -LiteralPath $Current `
+                -Force -ErrorAction Stop)
+        }
+        catch {
+            $Stats.FilesSkipped++
+            continue
+        }
+
+        foreach ($Item in $Items) {
+
+            # Never traverse or delete junctions / symlinks.
+            if ($Item.Attributes -band
+                [IO.FileAttributes]::ReparsePoint) {
+                $Stats.FilesSkipped++
+                continue
+            }
+
+            if ($Item.PSIsContainer) {
+                $Directories.Add($Item.FullName)
+                $Stack.Push($Item.FullName)
+            }
+            else {
+                try {
+                    Remove-Item -LiteralPath $Item.FullName `
+                        -Force -ErrorAction Stop
+
+                    $Stats.FilesDeleted++
+                }
+                catch {
+                    # Locked or protected files are skipped.
+                    $Stats.FilesSkipped++
+                }
+            }
+        }
+    }
+
+    # Remove empty directories deepest first.
+    foreach ($Folder in ($Directories |
+        Sort-Object Length -Descending)) {
+        try {
+            Remove-Item -LiteralPath $Folder `
+                -ErrorAction Stop
+        }
+        catch {
+            # Leave nonempty or protected folders alone.
+        }
+    }
+}
+
+try {
+    $BeforeBytes = Get-FreeBytes
+
+    if ($BeforeBytes -ge ($TargetGB * 1GB)) {
+        Write-Output "COMPLIANT | Free: $(Format-GB $BeforeBytes) GB | No cleanup required"
+        exit 0
+    }
+
+    # ==============================================
+    # 1. Windows Temporary Files
+    # ==============================================
+
+    Clear-SafeFolder "$env:windir\Temp"
+    $Results.Add("Windows Temp: processed")
+
+    # ==============================================
+    # 2. SYSTEM and Service Account Temp
+    # ==============================================
+
+    $ServicePaths = @(
+        "$env:windir\System32\config\systemprofile\AppData\Local\Temp",
+        "$env:windir\ServiceProfiles\LocalService\AppData\Local\Temp",
+        "$env:windir\ServiceProfiles\NetworkService\AppData\Local\Temp"
+    )
+
+    foreach ($Path in $ServicePaths) {
+        Clear-SafeFolder $Path
+    }
+
+    $Results.Add("Service Temp: processed")
+
+    # ==============================================
+    # 3. All Local User Profile Temporary Files
+    # ==============================================
+
+    $Profiles = @(Get-CimInstance Win32_UserProfile |
+        Where-Object {
+            $_.LocalPath -and
+            (Test-Path -LiteralPath $_.LocalPath -PathType Container)
+        })
+
+    foreach ($Profile in $Profiles) {
+        $LocalAppData = Join-Path $Profile.LocalPath `
+            "AppData\Local"
+
+        Clear-SafeFolder (Join-Path $LocalAppData "Temp")
+
+        # Application-generated crash dumps
+        Clear-SafeFolder (Join-Path $LocalAppData "CrashDumps")
+    }
+
+    $Results.Add("User Temp and CrashDumps: processed")
+
+    # ==============================================
+    # 4. Windows Error Reporting
+    # ==============================================
+
+    $WERPaths = @(
+        "$env:ProgramData\Microsoft\Windows\WER\ReportArchive",
+        "$env:ProgramData\Microsoft\Windows\WER\ReportQueue",
+        "$env:ProgramData\Microsoft\Windows\WER\Temp"
+    )
+
+    foreach ($Path in $WERPaths) {
+        Clear-SafeFolder $Path
+    }
+
+    $Results.Add("Windows Error Reporting: processed")
+
+    # ==============================================
+    # 5. Windows Crash Minidumps
+    # ==============================================
+
+    Clear-SafeFolder "$env:windir\Minidump"
+
+    $Results.Add("Windows Minidumps: processed")
+
+    # ==============================================
+    # 6. Delivery Optimization Cache
+    # ==============================================
+
+    try {
+        $DOCmd = Get-Command `
+            "Delete-DeliveryOptimizationCache" `
+            -ErrorAction SilentlyContinue
+
+        if ($DOCmd) {
+            Delete-DeliveryOptimizationCache `
+                -Force -ErrorAction Stop
+
+            $Results.Add("Delivery Optimization: cleared")
+        }
+        else {
+            $Results.Add("Delivery Optimization: command unavailable")
+        }
+    }
+    catch {
+        $Results.Add("Delivery Optimization: $($_.Exception.Message)")
+    }
+
+    # ==============================================
+    # 7. SCCM / MECM Client Cache Cleanup
+    # NO AGE RESTRICTION
+    # ==============================================
+
+    try {
+        $CCM = New-Object -ComObject `
+            "UIResource.UIResourceMgr" -ErrorAction Stop
+
+        $CacheInfo = $CCM.GetCacheInfo()
+        $CacheItems = @($CacheInfo.GetCacheElements())
+
+        foreach ($Item in $CacheItems) {
+            try {
+                $CacheInfo.DeleteCacheElement(
+                    [string]$Item.CacheElementID
+                )
+
+                $Stats.SCCMDeleted++
+            }
+            catch {
+                $Stats.SCCMFailed++
+            }
+        }
+
+        $Results.Add(
+            "SCCM Cache: $($Stats.SCCMDeleted) removed, $($Stats.SCCMFailed) failed"
+        )
+    }
+    catch {
+        $Results.Add("SCCM Cache: $($_.Exception.Message)")
+    }
+
+    # ==============================================
+    # 8. Final Disk Space Verification
+    # ==============================================
+
+    $AfterBytes = Get-FreeBytes
+    $RecoveredBytes = $AfterBytes - $BeforeBytes
+
+    $BeforeGB = Format-GB $BeforeBytes
+    $AfterGB = Format-GB $AfterBytes
+    $RecoveredGB = Format-GB $RecoveredBytes
+
+    if ($AfterBytes -ge ($TargetGB * 1GB)) {
+        $Status = "COMPLIANT"
+        $ExitCode = 0
+    }
+    else {
+        $Status = "BELOW TARGET"
+        $ExitCode = 1
+    }
+
+    # Summary stays compact for Intune reporting.
+    Write-Output "$Status | Before: $BeforeGB GB | Recovered: $RecoveredGB GB | Current: $AfterGB GB | Target: $TargetGB GB | Files deleted: $($Stats.FilesDeleted) | Files skipped: $($Stats.FilesSkipped) | SCCM removed: $($Stats.SCCMDeleted) | SCCM failed: $($Stats.SCCMFailed)"
+
+    # Detailed output for manual testing.
+    foreach ($Result in $Results) {
+        Write-Output $Result
+    }
+
+    exit $ExitCode
+}
+catch {
+    Write-Output "REMEDIATION ERROR: $($_.Exception.Message)"
+    exit 1
+}
