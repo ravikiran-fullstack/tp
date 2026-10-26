@@ -1,0 +1,30 @@
+
+# Windows 11 25H2 - Disk Space Detection
+# Minimum required free space: 45 GB
+
+$MinimumGB = 45
+$Drive = "C:"
+
+try {
+    $Disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$Drive'" -ErrorAction Stop
+
+    if ($null -eq $Disk) {
+        Write-Output "ERROR: Drive $Drive not found."
+        exit 1
+    }
+
+    $FreeGB = [math]::Round($Disk.FreeSpace / 1GB, 2)
+
+    if ($Disk.FreeSpace -lt ($MinimumGB * 1GB)) {
+        Write-Output "NON-COMPLIANT | Free: $FreeGB GB | Required: $MinimumGB GB | Cleanup required"
+        exit 1
+    }
+    else {
+        Write-Output "COMPLIANT | Free: $FreeGB GB | Required: $MinimumGB GB | No cleanup required"
+        exit 0
+    }
+}
+catch {
+    Write-Output "ERROR: Unable to check disk space. $($_.Exception.Message)"
+    exit 1
+}
