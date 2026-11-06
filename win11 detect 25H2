@@ -1,0 +1,108 @@
+
+# Windows 11 25H2 - SCCM Feature Update Status
+# Read-only Intune Remediation Detection Script
+
+$ErrorActionPreference = "Stop"
+
+$states = @{
+    0  = "No active installation"
+    1  = "Available"
+    2  = "Submitted"
+    3  = "Detecting"
+    4  = "Pre-download"
+    5  = "Downloading"
+    6  = "Waiting to install"
+    7  = "Installing"
+    8  = "Pending soft reboot"
+    9  = "Pending hard reboot"
+    10 = "Waiting for reboot"
+    11 = "Verifying"
+    12 = "Installation complete"
+    13 = "Error"
+    14 = "Waiting for maintenance window"
+    15 = "Waiting for user logon"
+    16 = "Waiting for user logoff"
+    17 = "Waiting for job user logon"
+    18 = "Waiting for user logoff"
+    19 = "Waiting for user logon"
+    20 = "Waiting for retry"
+    21 = "Waiting for presentation mode"
+    22 = "Pre-downloading content"
+    23 = "Pre-downloading dependencies"
+    24 = "Download failed"
+    25 = "Pre-download failed"
+    26 = "Download successful"
+    27 = "Post-install evaluation"
+    28 = "Waiting for network"
+}
+
+try {
+    $os = Get-CimInstance Win32_OperatingSystem
+    $reg = Get-ItemProperty `
+        "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+
+    $build = "$($os.BuildNumber).$($reg.UBR)"
+    $version = $reg.DisplayVersion
+
+    $ccm = Get-Service CcmExec -ErrorAction SilentlyContinue
+
+    $disk = Get-CimInstance Win32_LogicalDisk `
+        -Filter "DeviceID='C:'"
+    $freeGB = if ($disk) {
+        [math]::Round($disk.FreeSpace / 1GB, 1)
+    } else { "Unknown" }
+
+    $updates = @(
+        Get-CimInstance `
+            -Namespace "root\ccm\ClientSDK" `
+            -ClassName CCM_SoftwareUpdate |
+        Where-Object {
+            $_.Name -match "25H2" -and
+            $_.Name -match "Windows 11"
+        }
+    )
+
+    $result = @(
+        "Device=$env:COMPUTERNAME"
+        "OSVersion=$version"
+        "OSBuild=$build"
+        "SCCMService=$(if($ccm){$ccm.Status}else{'Missing'})"
+        "FreeDiskGB=$freeGB"
+    )
+
+    if ($os.BuildNumber -eq 26200) {
+        $result += "UpgradeStatus=25H2 installed"
+    }
+    elseif ($updates.Count -eq 0) {
+        $result += "UpgradeStatus=25H2 not found in SCCM ClientSDK"
+    }
+    else {
+        foreach ($update in $updates) {
+            $state = [int]$update.EvaluationState
+
+            $stateText = if ($states.ContainsKey($state)) {
+                $states[$state]
+            } else {
+                "Unknown ($state)"
+            }
+
+            $err = "0x{0:X8}" -f ([uint32]$update.ErrorCode)
+
+            $result += "Update=$($update.Name)"
+            $result += "State=$stateText ($state)"
+            $result += "Progress=$($update.PercentComplete)%"
+            $result += "Error=$err"
+        }
+    }
+
+    # Intune Remediation output limit is 2048 characters
+    $output = $result -join " | "
+    Write-Output $output.Substring(
+        0, [Math]::Min(2000, $output.Length)
+    )
+    exit 0
+}
+catch {
+    Write-Output "StatusQueryFailed=$($_.Exception.Message)"
+    exit 0
+}
