@@ -1,0 +1,108 @@
+SCCM 25H2 Content Status Troubleshooting
+
+CAS reports Downloaded = Yes | Primary Site reports Downloaded = No
+Investigation guide and remediation decision plan  •  9 November 2026
+1. Incident summary
+Windows 11 25H2 feature update content appears to be downloaded and deployment initiated from the Central Administration Site (CAS) is working. On the affected Primary Site, the update displays Downloaded = No, and deployments initiated there fail. The issue persisted after a Configuration Manager site upgrade. The team initially suspected metadata but has not confirmed the root cause.
+Area
+CAS
+Affected Primary Site
+Downloaded state
+Yes (reported)
+No (reported)
+Deployment behavior
+Works (reported)
+Fails (reported)
+After site upgrade
+No reported issue
+Problem persists
+Important: Presence of physical content alone does not prove the update is recognized as downloaded, correctly associated with its deployment package, and available to clients. A failed Primary-initiated deployment suggests a functional problem, not necessarily a cosmetic console issue.
+2. First identify which status is wrong
+1. On both CAS and Primary consoles, open Software Library > Software Updates > All Software Updates. Locate the same 25H2 feature update, including architecture, language and revision. Compare the Downloaded column.
+2. Open the update Properties > Content Information, where available, and compare the referenced content information and status. Record the CI Unique ID, content identifiers and revision using supported console/PowerShell methods.
+3. Independently check Monitoring > Distribution Status > Content Status for the deployment package containing the update. Note the package ID, source path, and each DP distribution state.
+4. Confirm whether the failed Primary-initiated deployment fails at package creation/download/distribution, policy delivery, or client download. Collect the exact error code and relevant timestamps.
+These are distinct states: update-level Downloaded, deployment package content, and DP distribution. Do not conflate them.
+3. Verify database replication between CAS and Primary
+5. In the console, navigate to Monitoring > Database Replication. Inspect the CAS-to-Primary replication link and associated replication groups.
+6. Check whether replication is Active, Degraded, or Failed. Compare the timestamps with the last attempted content download or package change.
+7. Review RCMCtrl.log on both sites for replication backlog or errors. Where applicable, check replmgr.log and objreplmgr.log for relevant replication processing.
+8. If the link is unhealthy, use Replication Link Analyzer and follow supported repair guidance with Microsoft support. Avoid direct SQL modifications.
+A healthy overall replication link does not guarantee that a particular update/content association is consistent. Treat replication as one hypothesis to test, not a confirmed diagnosis.
+4. Validate the deployment package and content
+9. In Monitoring > Distribution Status > Content Status, locate the specific deployment package containing the 25H2 feature update. Record package ID and DP status.
+10. In Software Library > Application Management > Packages or Software Updates > Deployment Packages, inspect the deployment package source path and package membership. Confirm the source is reachable by the site server computer account.
+11. Use the supported Validate action on affected DPs, where available, and review resulting status messages. Validation checks DP content integrity; it does not directly repair the update-level Downloaded flag.
+12. If validation fails, inspect missing files, access permissions and hash failures before redistributing. Use Content Library Explorer for content-library inspection if appropriate.
+13. Compare the exact same deployment package and content IDs between CAS and Primary; avoid assuming that similar 25H2 titles reference the same update revision.
+5. Logs to collect
+Log
+Primary purpose
+RCMCtrl.log
+CAS–Primary database replication activity and errors
+replmgr.log
+File-based replication processing
+objreplmgr.log
+Object replication processing where applicable
+distmgr.log
+Deployment package and content distribution processing
+pkgxfermgr.log
+Package transfers to distribution points
+PatchDownloader.log
+Software update content download problems
+smsdpprov.log (DP)
+Distribution-point provider actions and validation context
+Client logs
+CAS.log, ContentTransferManager.log, DataTransferService.log, UpdatesDeployment.log when a client deployment fails
+PatchDownloader.log location varies by download method: for a manual console download, check %TEMP% on the computer running the console; for an ADR, check the relevant site-server/client log location. Record exact timestamps and identify the correct log instance before drawing conclusions.
+6. Targeted read-only PowerShell log scan
+Run on the Primary Site server in an elevated PowerShell window if access allows; change the log directory to match the actual installation. This only searches recent log lines and does not make changes.
+$LogPath = "D:\Program Files\Microsoft Configuration Manager\Logs"
+$Logs = @("RCMCtrl.log", "replmgr.log", "objreplmgr.log",
+         "distmgr.log", "pkgxfermgr.log")
+foreach ($Log in $Logs) {
+   $File = Join-Path $LogPath $Log
+   if (Test-Path $File) {
+       Write-Host "`n===== $Log =====" -ForegroundColor Cyan
+       Get-Content $File -Tail 300 |
+           Select-String -Pattern "error|failed|exception|25H2" |
+           Select-Object -Last 30
+   }
+}
+After collecting the Package ID, CI Unique ID and Content ID, search complete logs for those exact values, not just generic error terms. Rotated historical logs may be needed.
+7. Remediation decision matrix
+Evidence found
+Recommended supported action
+Replication degraded/failed
+Investigate and repair replication via supported tools and Microsoft guidance
+Package source inaccessible or permission denied
+Correct share/NTFS access for site server and distribution workflow
+Content missing/corrupt on DP
+Validate, then redistribute affected package content as appropriate
+Different update revision or content association
+Correct synchronization/package association using supported ConfigMgr procedures
+Content validates, replication looks healthy, Primary still says No
+Escalate content metadata/state inconsistency to Microsoft with IDs, logs and comparison screenshots
+8. Recommended execution order
+14. Capture CAS and Primary screenshots for the same update and its properties, including update revision and exact Downloaded column.
+15. Collect update CI/Content IDs, deployment package ID, affected DP and failure error code.
+16. Check Database Replication status and RCMCtrl.log on both sites.
+17. Validate package source and distribution status, then inspect distmgr.log and pkgxfermgr.log for the matching Package ID.
+18. Review PatchDownloader.log for a controlled, authorized test download if necessary.
+19. Repair only the confirmed failing layer; retest update-level status and a small pilot Primary-initiated deployment.
+20. If the inconsistency persists, attach evidence to the already opened Microsoft support case and request analysis of update-content state and CAS–Primary replication.
+9. Safety and operational cautions
+• Do not directly update Configuration Manager SQL tables or manually toggle a Downloaded flag; this is unsupported and may corrupt site state.
+• Do not use CMUpdateReset.exe to reset a Windows 11 25H2 feature update; it targets Configuration Manager in-console servicing updates.
+• Do not indiscriminately delete source directories or purge the content library. Preserve evidence before any changes.
+• Continue the working CAS deployment path temporarily only if it is approved and is distributing content reliably to the expected clients.
+• Avoid repeated mass redistributions until the failing stage is identified.
+10. Suggested Microsoft case question
+“Why does our CAS recognize the Windows 11 25H2 update content as downloaded and successfully initiate deployments, while the Primary Site reports Downloaded = No and Primary-initiated deployments fail? The issue persists after our Configuration Manager site upgrade. Please help determine whether this is update metadata, content/package association, database replication, or another supported content-state issue, and advise a supported repair.”
+11. Other outstanding items from the meeting
+• Scan for Software Updates fails during OSD but succeeds after provisioning. A separate Microsoft ticket is being planned. Investigate task-sequence timing, software update policy/SUP access, client readiness and smsts.log/WUAHandler.log/ScanAgent.log.
+• Content pre-staging was previously unsuccessful and remains open for separate investigation.
+• Ensure the relevant engineers, including Nathan, are included on the Microsoft support cases.
+12. References to verify against your ConfigMgr release
+Microsoft Learn: Monitor database replication; Software update downloads; Monitor content distribution; Content Library Explorer; Configuration Manager log files. Consult the documentation matching your installed Current Branch release and follow Microsoft support guidance for repairs.
+SCCM 25H2 | Internal troubleshooting reference
