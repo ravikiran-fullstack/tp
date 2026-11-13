@@ -1,0 +1,7 @@
+Hi Valentin, thank you for reaching out.
+
+Our SCCM primary site shows the Windows 11 25H2 feature update as “Not Downloaded,” which is blocking the rollout. Approximately 30,000 devices are still waiting to receive the update. The confirmed impact is to the upgrade rollout. We’re still confirming the department breakdown and any direct impact on users or business applications.
+
+With Windows 11 23H2 nearing end of support for the affected devices, this delay puts our upgrade timeline at risk and could leave devices without regular security updates, creating security and compliance risks.
+
+Could you please assign a Configuration Manager engineer as soon as possible to investigate the primary site issue and help us resume the rollout? Please let us know the next steps and whether there’s an immediate workaround.
