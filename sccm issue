@@ -4,4 +4,20 @@ Our SCCM primary site shows the Windows 11 25H2 feature update as “Not Downloa
 
 With Windows 11 23H2 nearing end of support for the affected devices, this delay puts our upgrade timeline at risk and could leave devices without regular security updates, creating security and compliance risks.
 
-Could you please assign a Configuration Manager engineer as soon as possible to investigate the primary site issue and help us resume the rollout? Please let us know the next steps and whether there’s an immediate workaround.
+Could you please assign a Configuration
+
+
+Hi Craig,
+
+Thank you for the update. I sent the requested details yesterday, but the Outlook outage delayed delivery until this morning.
+
+Once you’ve reviewed the logs, could you please share your earliest availability for a call? The issue is still blocking the Windows 11 25H2 rollout for approximately 30,000 devices.
+
+Thanks,
+Vijaya
+
+
+
+
+
+ Manager engineer as soon as possible to investigate the primary site issue and help us resume the rollout? Please let us know the next steps and whether there’s an immediate workaround.
